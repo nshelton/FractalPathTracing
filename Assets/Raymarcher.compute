@@ -1,0 +1,147 @@
+﻿#pragma kernel Draw
+#pragma kernel Reproject
+
+RWTexture2D<float4> u_outputColor;
+RWTexture2D<float> u_outputDepth;
+
+RWTexture2D<float4> u_lastColor;
+RWTexture2D<float> u_lastDepth;
+
+
+float3 u_resolution;
+float3 u_camPos;
+float4x4 u_cam2World;
+float4x4 u_lastCamToThisCam;
+float4x4 u_camProjection;
+
+float3 u_camUp;
+float3 u_camFwd;
+float u_camFocal;
+float u_time;
+
+#define STEP_RATIO 0.9
+#define NUM_STEPS 100
+
+#include "distance_functions.cginc"
+
+float2 DE(float3 p)
+{
+    return pseudo_knightyan(p);
+}
+
+float thresh(float3 p)
+{
+    //vertical pixel size 
+    float z = length(p - u_camPos);
+    float px = z * tan(u_camFocal / 2.0) / u_resolution.y;
+    return px * 2.;
+}
+
+float3 getNormal(in float3 p)
+{
+
+    float2 e = float2(thresh(p) , -thresh(p));
+    return normalize(
+        e.xyy * DE(p + e.xyy).x +
+        e.yyx * DE(p + e.yyx).x +
+        e.yxy * DE(p + e.yxy).x +
+        e.xxx * DE(p + e.xxx).x);
+}
+
+#include "rendering.cginc"
+
+
+float sdLink(in float3 p, in float le, in float r1, in float r2)
+{
+    float3 q = float3(p.x, max(abs(p.y) - le, 0.0), p.z);
+    return length(float2(length(q.xy) - r1, q.z)) - r2;
+}
+
+float3 shade(float3 p)
+{
+    float3 n = getNormal(p);
+    float3 m_viewDir = normalize(u_camPos - p);
+    return abs(dot(normalize(p - u_camPos), n));
+}
+
+void RenderPixel(float2 pixel, out float depth, out float3 color)
+{
+    float2 p = (-u_resolution.xy + 2.0 * pixel.xy) / u_resolution.y;
+
+    float3 ro = float3(u_cam2World[0].w, u_cam2World[1].w, u_cam2World[2].w);
+    float3 rd = mul(u_cam2World, float4(-p.x, -p.y, u_camFocal, 0));
+
+    float3 pos;
+    depth = 0;
+    float orbit = 0;
+
+    bool hit = false;
+    float steps = 0;
+
+    for (int i = 0; i < NUM_STEPS; i++)
+    {
+        pos = ro + rd * depth;
+        float2 dd = DE(pos) * 0.7;
+
+        if (dd.x < thresh(pos))
+        {
+            hit = true;
+            orbit = dd.y;
+            break;
+        }
+
+        depth += dd.x;
+        steps += 1;
+    }
+
+    color = (float3) 0.0;
+
+    if (hit)
+    {
+        color = shade(pos); // * pow((1.0 - steps / (float) NUM_STEPS), 2.0);
+        //color *= softshadow(pos, float3(sin(u_time), 1, 0));
+         color *=  pal(pow(0.09 * orbit, 0.1) + u_time * 0.1, float3(0.5, 0.5, 0.5), float3(0.5, 0.5, 0.5), float3(1.5, 0.3, 1.1), float3(0.3, 0.20, 0.10));
+        color = sqrt(color);
+    }
+}
+
+[numthreads(8,8,1)]
+void Draw(uint3 id : SV_DispatchThreadID)
+{
+    float2 pix = id.xy;
+
+    float3 color = (float3)0;
+    float AA = 1;
+    float depth = 0;
+    for (int dx = 0; dx < AA; dx++)
+    {
+        for (int dy = 0; dy < AA; dy++)
+        {
+            RenderPixel((float2) id.xy + float2(dx, dy) / AA, depth, color);
+        }
+    }
+
+    color /= AA*AA;
+
+    u_outputColor[id.xy] = float4(color, 1);
+    u_outputDepth[id.xy] = depth;
+}
+
+[numthreads(8, 8, 1)]
+void Reproject(uint3 id : SV_DispatchThreadID)
+{
+    float lastDepth = u_lastDepth[id.xy];
+    float4 lastColor = u_lastColor[id.xy];
+
+    float2 p = (-u_resolution.xy + 2.0 * id.xy) / u_resolution.y;
+
+    float4 camPointLastFrame = float4(-p.x, -p.y, u_camFocal, 0) * lastDepth;
+    float4 camPointThisFrame = mul(u_lastCamToThisCam, camPointLastFrame);
+
+    float4 pixel = mul(u_camProjection, camPointThisFrame);
+    pixel /= pixel.z;
+    pixel.xy *= u_resolution.xy;
+
+    u_outputColor[pixel.xy] = lastColor;
+    u_outputDepth[pixel.xy] = lastDepth;
+}

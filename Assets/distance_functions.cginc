@@ -1,9 +1,10 @@
 ﻿#include "foundation.cginc"
 
-float3 u_paramA;
-float3 u_paramB;
-float3 u_paramC;
-float3 u_paramD;
+float4 u_paramA;
+float4 u_paramB;
+float4 u_paramC;
+float4 u_paramD;
+float _LEVELS;
   
 float2 pseudo_knightyan(float3 p)
 {
@@ -33,12 +34,12 @@ float2 pseudo_knightyan(float3 p)
 float2 tglad_variant(float3 z0)
 {
     // z0 = modc(z0, 2.0);
-    float mr = 0.25, mxr = 1.0;
+    float mr = u_paramD.x, mxr = u_paramD.y;
 
-    float4 scale = (float) (-2), p0 = u_paramA.xyzz;
+    float4 scale = (float4) (u_paramD.z), p0 = u_paramA.xyzz;
     float4 z = float4(z0, 1.0);
     float orbit = 0;
-    for (int n = 0; n < 8; n++)
+    for (int n = 0; n < _LEVELS; n++)
     {
         float3 start = z;
         z.xyz = clamp(z.xyz, -u_paramB.x, u_paramB.x) * 2.0 - z.xyz;
@@ -46,7 +47,7 @@ float2 tglad_variant(float3 z0)
         z += p0;
         orbit += length(start - z);
     }
-    float dS = (length(max(abs(z.xyz) - u_paramC.xyz, 0.0)) - 0.06) / z.w;
+    float dS = (length(max(abs(z.xyz) - u_paramC.xyz, 0.0)) - 0) / z.w;
     return float2(dS, orbit);
 }
 
@@ -60,7 +61,7 @@ float2 tglad(float3 z0)
     float4 z = float4(z0, 1.0);
     float orbit = 0;
 
-    for (int n = 0; n < 10; n++)
+    for (int n = 0; n < _LEVELS; n++)
     {
         float3 start = z.xyz;
 
@@ -89,7 +90,7 @@ float2 hartverdrahtet(float3 f)
     fc.z = -.38;
  
     float v = 1.;
-    for (int i = 0; i < 12; i++)
+    for (int i = 0; i < _LEVELS; i++)
     {
         float3 start = f;
 
@@ -145,9 +146,9 @@ float2 polycrust(float3 p)
         
     float3 p0 = p;
 
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < _LEVELS; i++)
     {
-        p = rotate_vector(p - t / s, fromtwovectors(u_paramA.xyz, u_paramD.xyz));
+        p = rotate_vector(p - t / s, fromtwovectors(float3(0,1,0), u_paramD.xyz));
 
         d = min(d, sdBox(p.xyz / s, dim) * s);
         p = abs(p);
@@ -199,13 +200,13 @@ float2 MBOX(float3 z)
     float3 offset = z;
     float dr = 1.0;
 
-    float Scale = u_paramC.x;
+    float Scale = u_paramC.x - (z.y - u_paramD.w) *u_paramD.z;
     float iter = 0.0;
 
     float orbit = 0;
     float3 z_prime = z;
 
-    for (int n = 0; n < 7; n++)
+    for (int n = 0; n < _LEVELS; n++)
     {
         boxFold(z, dr); // Reflect
         sphereFold(z, dr); // Sphere Inversion

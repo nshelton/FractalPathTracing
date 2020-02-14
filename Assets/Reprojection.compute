@@ -1,0 +1,83 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+
+float4x4 _WorldToLastFrameProj;
+float4x4 _WorldToLastFrame;
+float4x4 _CameraInverseProjection;
+
+SamplerState MyLinearClampSampler;
+Texture2D<float4> _LastFrameConverged;
+Texture2D<float4> _ConfidenceConvergedLastFrame;
+
+RWTexture2D<float4> _ThisFrame;
+RWTexture2D<float4> _ThisFrameDepth;
+float4x4 _ThisFrameToWorld;
+
+RWTexture2D<float4> _Result;
+RWTexture2D<float4> _ResultConfidence;
+
+float _Sample;
+
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _ThisFrame.GetDimensions(width, height);
+    float2 uv = float2((float2(id.xy) + 0.5) / float2(width, height) * 2.0f - 1.0f);
+
+    float4 thisFrame = _ThisFrame.Load(id.xy);
+
+    // Project this depth into world
+    float depth = thisFrame.a;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    float3 origin = mul(_ThisFrameToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    direction = mul(_ThisFrameToWorld, float4(direction, 0.0f)).xyz;
+    float3 worldPos = origin + direction * depth;
+
+    // project worldpos into last frame (converged result)
+    float4 clip = mul(_WorldToLastFrameProj, float4(worldPos, 1));
+
+    float2 pixel = (0.5 + 0.5 * (clip.xy / clip.w));
+
+    float4 lastFrame = _LastFrameConverged.SampleLevel(MyLinearClampSampler, pixel, 0);
+    float confidence = _ConfidenceConvergedLastFrame.SampleLevel(MyLinearClampSampler, pixel, 0).r;
+
+    float lastFrameDepthComputed = abs(mul(_WorldToLastFrame, float4(worldPos, 1)).z);
+    float depthDiff = (lastFrameDepthComputed - lastFrame.a) * (lastFrameDepthComputed - lastFrame.a);
+
+   /* // check if edge
+    int rad = 5;
+    float upDepth = _ThisFrame.Load(id.xy + int2(0, rad)).a;
+    float leftDepth = _ThisFrame.Load(id.xy + int2(rad, 0)).a;
+    float downDepth = _ThisFrame.Load(id.xy + int2(0, -rad)).a;
+    float rightDepth = _ThisFrame.Load(id.xy + int2(-rad, 0)).a;
+    float nighborDepthDiff =
+        (depth - upDepth) * (depth - upDepth) +
+        (depth - leftDepth) * (depth - leftDepth) +
+        (depth - downDepth) * (depth - downDepth) +
+        (depth - rightDepth) * (depth - rightDepth);
+    */
+    // out of bounds
+    if ( depthDiff > 1 || pixel.x < 0 || pixel.y < 0|| pixel.x > 1 || pixel.y > 1 || depth > 100000)
+    {
+        _Result[id.xy] = thisFrame;
+        _ResultConfidence[id.xy] = float4(0,0,0,0);
+    }
+    else
+    {
+
+        float a = 1.0f / (confidence + 1.0f);
+
+        float diff = length(thisFrame.rgb - lastFrame.rgb);
+        confidence += 1; // (1.0f / 1.0f + diff);
+
+        float3 newColor = a * thisFrame.rgb + (1 - a) * lastFrame.rgb;
+        //_Result[id.xy] = float4(saturate(newColor), confidence);
+        //newColor = float3(0, 1, 0);
+        _Result[id.xy] = float4(saturate(newColor), depth);
+        _ResultConfidence[id.xy] = float4(confidence, 0, 0, 0);
+    }
+
+}

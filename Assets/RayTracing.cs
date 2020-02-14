@@ -1,5 +1,4 @@
-﻿using FFmpegOut;
-using System.Collections;
+﻿using System.Collections;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
@@ -8,10 +7,13 @@ using UnityEngine;
 public class RayTracing : MonoBehaviour
 {
     public ComputeShader RayTracingShader;
+    public ComputeShader ReprojectionShader;
+ 
     public Texture SkyboxTexture;
     public Material _addMaterial;
 
     public bool Integrate;
+    public bool Reproject;
 
     [Header("Render Params")]
     [Range(0,1)] public float Specular;
@@ -21,9 +23,12 @@ public class RayTracing : MonoBehaviour
     [Range(0,5)] public float Exposure;
     public Color SkyColor;
     public Vector3 Emission;
-    public int Palette;
+    [Range(0,10)] public int Palette;
+    public Vector2 ColorParam;
 
     [Header("Fractal Params")]
+
+    [Range(1,15)] public float Levels;
     public Vector4 ParamA;
     public Vector4 ParamB;
     public Vector4 ParamC;
@@ -37,9 +42,20 @@ public class RayTracing : MonoBehaviour
     private Camera _camera;
     private float _lastFieldOfView;
     private RenderTexture _target;
+    private RenderTexture _targetDepth;
+    private RenderTexture _targetB;
+    private RenderTexture _targetBDepth;
     private RenderTexture _converged;
+    private RenderTexture _confidenceConverged;
+    private RenderTexture _confidenceConvergedLastFrame;
+    
     private uint _currentSample = 0;
     private List<Transform> _transformsToWatch = new List<Transform>();
+
+    float _renderedFrameNum = 0;
+    Matrix4x4 m_worldToLastFrame;
+    RenderTexture _convergedLastFrame;
+
 
     private void Awake()
     {
@@ -71,7 +87,7 @@ public class RayTracing : MonoBehaviour
             _lastFieldOfView = _camera.fieldOfView;
         }
 
-        if (!Record)
+        if (!Record && !Reproject)
             foreach (Transform t in _transformsToWatch)
             {
                 if (t.hasChanged)
@@ -85,8 +101,8 @@ public class RayTracing : MonoBehaviour
     private void SetShaderParameters()
     {
         RayTracingShader.SetTexture(0, "_SkyboxTexture", SkyboxTexture);
-        RayTracingShader.SetMatrix("_CameraToWorld", _camera.cameraToWorldMatrix);
-        RayTracingShader.SetMatrix("_CameraInverseProjection", _camera.projectionMatrix.inverse);
+        RayTracingShader.SetMatrix("_CameraToWorld", _camera.transform.localToWorldMatrix);
+        RayTracingShader.SetMatrix("_CameraInverseProjection", invProjection);
         RayTracingShader.SetVector("_PixelOffset", new Vector2(Random.value, Random.value));
         RayTracingShader.SetFloat("_Seed", Random.value);
 
@@ -96,15 +112,19 @@ public class RayTracing : MonoBehaviour
         RayTracingShader.SetVector("u_paramD", ParamD);
         RayTracingShader.SetVector("_SkyColor", SkyColor);
         RayTracingShader.SetVector("_EmisisonRange", Emission);
+        RayTracingShader.SetVector("_ColorParam", ColorParam);
+        
         RayTracingShader.SetFloat("_Palette", Palette);
 
         RayTracingShader.SetFloat("_Specular", Specular);
         RayTracingShader.SetFloat("_Smoothness", Smoothness);
         RayTracingShader.SetFloat("_Threshold", Threshold);
         RayTracingShader.SetFloat("_Steps", Steps);
+        RayTracingShader.SetFloat("_LEVELS", Levels);
 
         _addMaterial.SetFloat("_Sample", _currentSample);
         _addMaterial.SetFloat("_Exposure", Exposure);
+        _addMaterial.SetTexture("_Depth", _targetDepth);
 
     }
 
@@ -116,6 +136,9 @@ public class RayTracing : MonoBehaviour
             if (_target != null)
             {
                 _target.Release();
+                _targetDepth.Release();
+                _targetB.Release();
+                _targetBDepth.Release();
                 _converged.Release();
             }
 
@@ -124,24 +147,52 @@ public class RayTracing : MonoBehaviour
                 RenderTextureFormat.ARGBFloat, RenderTextureReadWrite.Linear);
             _target.enableRandomWrite = true;
             _target.Create();
-            _converged = new RenderTexture(Screen.width, Screen.height, 0,
-                RenderTextureFormat.ARGBFloat, RenderTextureReadWrite.Linear);
-            _converged.enableRandomWrite = true;
+            _targetDepth = new RenderTexture(_target);
+            _targetDepth.Create();
+            _targetB = new RenderTexture(_target);
+            _targetB.Create();
+            _targetBDepth = new RenderTexture(_target);
+            _targetBDepth.Create();
+            _converged = new RenderTexture(_target);
             _converged.Create();
+            _convergedLastFrame = new RenderTexture(_target);
+            _convergedLastFrame.Create();
+            _confidenceConverged = new RenderTexture(_target);
+            _confidenceConverged.Create();
+            _confidenceConvergedLastFrame = new RenderTexture(_target);
+            _confidenceConvergedLastFrame.Create();
+            
 
             // Reset sampling
             _currentSample = 0;
         }
     }
-    float _frameNum = 0;
+
+
+    public void ClearRendertexture(RenderTexture renderTexture)
+    {
+
+        RenderTexture rt = RenderTexture.active;
+        RenderTexture.active = renderTexture;
+        GL.Clear(true, true, Color.clear);
+        RenderTexture.active = rt;
+    }
+
+    Matrix4x4 projection;
+    Matrix4x4 invProjection;
+
     private void Render(RenderTexture destination)
     {
+
+        projection = _camera.projectionMatrix;
+        invProjection = projection.inverse;
+
         if ((_currentSample > FrameSamples) && Record)
         {
-            ScreenCapture.CaptureScreenshot( _frameNum + ".png");
-            _currentSample = 0;
-            _frameNum++;
-            if(_frameNum > numFrames)
+            ScreenCapture.CaptureScreenshot( _renderedFrameNum + ".png");
+            _currentSample = 0; 
+            _renderedFrameNum++;
+            if(_renderedFrameNum > numFrames)
             {
                 EditorApplication.ExecuteMenuItem("Edit/Play");
                 Record = false;
@@ -151,17 +202,42 @@ public class RayTracing : MonoBehaviour
         // Make sure we have a current render target
         InitRenderTexture();
 
-
         int threadGroupsX = Mathf.CeilToInt(Screen.width / 8.0f);
         int threadGroupsY = Mathf.CeilToInt(Screen.height / 8.0f);
 
         // Set the target and dispatch the compute shader
-        RayTracingShader.SetTexture(0, "Result", _target);
+        RayTracingShader.SetTexture(0, "Result", _target );
+        RayTracingShader.SetTexture(0, "ResultDepth", _targetDepth);
         RayTracingShader.Dispatch(0, threadGroupsX, threadGroupsY, 1);
-        Graphics.Blit(_target, _converged, _addMaterial);
+
+       if (Reproject)
+        {
+            Graphics.Blit(_converged, _convergedLastFrame);
+            Graphics.Blit(_confidenceConverged, _confidenceConvergedLastFrame);
+            ReprojectionShader.SetTexture(0, "_LastFrameConverged", _convergedLastFrame);
+            ReprojectionShader.SetTexture(0, "_ConfidenceConvergedLastFrame", _confidenceConvergedLastFrame);
+            ReprojectionShader.SetTexture(0, "_ThisFrame", _target);
+            ReprojectionShader.SetTexture(0, "_ThisFrameDepth", _targetDepth);
+
+            ReprojectionShader.SetTexture(0, "_Result", _converged);
+            ReprojectionShader.SetTexture(0, "_ResultConfidence", _confidenceConverged);
+            ReprojectionShader.SetFloat("_Sample", _currentSample);
+
+            ReprojectionShader.SetMatrix("_WorldToLastFrameProj", projection * m_worldToLastFrame);
+            ReprojectionShader.SetMatrix("_ThisFrameToWorld", _camera.transform.localToWorldMatrix);
+            ReprojectionShader.SetMatrix("_WorldToLastFrame", m_worldToLastFrame);
+            
+            ReprojectionShader.SetMatrix("_CameraInverseProjection", invProjection);
+            ReprojectionShader.Dispatch(0, threadGroupsX, threadGroupsY, 1);
+        }
+       else 
+        {
+            Graphics.Blit(_target, _converged, _addMaterial);
+        }
+
         Graphics.Blit(_converged, destination);
         _currentSample++;
-
+        m_worldToLastFrame = _camera.transform.worldToLocalMatrix;
     }
 
     private void OnRenderImage(RenderTexture source, RenderTexture destination)
@@ -172,6 +248,6 @@ public class RayTracing : MonoBehaviour
 
     private void OnValidate()
     {
-
+        _currentSample = 0;
     }
 }

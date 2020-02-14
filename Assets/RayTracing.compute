@@ -1,6 +1,7 @@
 ﻿#pragma kernel CSMain
 
 RWTexture2D<float4> Result;
+RWTexture2D<float4> ResultDepth;
 
 float4x4 _CameraToWorld;
 float4x4 _CameraInverseProjection;
@@ -18,6 +19,7 @@ float _Steps;
 float3 _EmisisonRange;
 float3 _SkyColor;
 float _Palette;
+float2 _ColorParam;
 
 #include "distance_functions.cginc"
 
@@ -33,33 +35,42 @@ float2 IFS(float3 p)
 {
     float3 z = p;
     float3 Offset = u_paramB;
-    int Iterations = 13;
     float Scale = u_paramA.x;
 
     float r = 0;
     int n = 0;
-    while (n < Iterations) {
+    float dd = 99999;
+    while (n < _LEVELS) {
         z = abs(z);
         z = rotateX(z, u_paramC.x);
         z = rotateY(z, u_paramC.y);
         z = rotateZ(z, u_paramC.z);
         z = z * Scale - Offset * (Scale - 1.0);
-        n++;
+        n++; 
+        dd = min(dd, sdBox(z, u_paramD.xyz));
     }
 
-    float sDist = length(p) - 0.3;
-    float fDist = length(z * pow(Scale, -float(n)) - 0.1);
     /* if (sDist < fDist)
      {
          return float2(sDist, 5);
      }
      else*/
-    return float2(fDist, 0);
+    return float2(dd, 0);
 }
+
+float opSmoothIntersection(float d1, float d2, float k) {
+    float h = clamp(0.5 - 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    return lerp(d2, d1, h) + k * h * (1.0 - h);
+}
+
 
 float2 DE(float3 p)
 {
-    return tglad_variant(p);
+    float d = MBOX(p);
+    float d2 = length(p) - u_paramD.x;
+
+
+    return d; //opSmoothIntersection(d, d2, 0.1);
 
 }
 
@@ -192,7 +203,7 @@ RayHit CreateRayHit()
 
 float3 palette(float t)
 {
- 
+    t = (t * _ColorParam.x) + _ColorParam.y;
     float3 color = pal(t, float3(0.5, 0.5, 0.5), float3(0.5, 0.5, 0.5), float3(1.0, 1.0, 1.0), float3(0.0, 0.33, 0.67));
     if (_Palette > (1.0)) color = pal(t, float3(0.5, 0.5, 0.5), float3(0.5, 0.5, 0.5), float3(1.0, 1.0, 1.0), float3(0.0, 0.10, 0.20));
     if (_Palette > (2.0)) color = pal(t, float3(0.5, 0.5, 0.5), float3(0.5, 0.5, 0.5), float3(1.0, 1.0, 1.0), float3(0.3, 0.20, 0.20));
@@ -213,7 +224,7 @@ RayHit MarchTrace(Ray ray)
 {
     RayHit bestHit = CreateRayHit();
     float3 pos;
-    float t = 0;
+    float t = 0.0;
     float2 dd;
     bool hit = false;
 
@@ -224,7 +235,7 @@ RayHit MarchTrace(Ray ray)
 
         pos = ray.origin + ray.direction * t;
         dd = DE(pos);
-        t += dd.x * 0.5;
+        t += dd.x *0.5;
 
         if (dd.x < _Threshold)
         {
@@ -240,12 +251,18 @@ RayHit MarchTrace(Ray ray)
 
         bestHit.distance = t;
         bestHit.position = ray.origin + t * ray.direction;
-        bestHit.normal = getNormal(pos);
-        bestHit.albedo = palette(log(dd.y));
+        bestHit.normal = estimateNormal(pos);
+        bestHit.albedo = palette((dd.y));
         bestHit.specular = _Specular;
         bestHit.smoothness = _Smoothness;
         bestHit.emission = bestHit.albedo * emission;
 
+
+        if (_Palette > 9)
+        {
+            bestHit.emission = bestHit.normal;
+            bestHit.albedo = (float3) 0;
+        }
     }
 
 
@@ -328,12 +345,12 @@ float3 Shade(inout Ray ray, RayHit hit)
         ray.energy = 0.0f;
  
         // Sample the skybox and write it
-      //  float theta = acos(ray.direction.y) / -PI;
-      //  float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
-      //  return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+       // float theta = acos(ray.direction.y) / -PI;
+       // float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+       // return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
    
         return _SkyColor;
-       return float3(0.5 + 0.5 * (ray.direction));
+      // return float3(0.5 + 0.5 * (ray.direction));
     }
 }
 
@@ -350,22 +367,39 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     uint width, height;
     Result.GetDimensions(width, height);
 
-    // Transform pixel to [-1,1] range
-    float2 uv = float2((id.xy + _PixelOffset) / float2(width, height) * 2.0f - 1.0f);
-
-    // Get a ray for the UVs
-    Ray ray = CreateCameraRay(uv);
-
-    // Trace and shade the ray
-    float3 result = float3(0, 0, 0);
-    for (int i = 0; i < 8; i++)
+    float avgDepth = 0;
+    float3 avgResult = float3(0, 0, 0);
+    
+    for (int spp = 0; spp < 1; spp++)
     {
-        RayHit hit = MarchTrace(ray);
-        result += ray.energy * Shade(ray, hit);
+        // Transform pixel to [-1,1] range
+        float2 uv = float2((id.xy + _PixelOffset) / float2(width, height) * 2.0f - 1.0f);
 
-        if (!any(ray.energy))
-            break;
+        // Get a ray for the UVs
+        Ray ray = CreateCameraRay(uv);
+
+        // Trace and shade the ray
+        float3 result = float3(0, 0, 0);
+        float depth = 0;
+
+        for (int i = 0; i < 4; i++)
+        {
+            RayHit hit = MarchTrace(ray);
+            if (i == 0)
+                depth = hit.distance;
+
+            result += ray.energy * Shade(ray, hit);
+
+            if (!any(ray.energy))
+                break;
+        }
+
+        avgResult += result;
+        avgDepth += depth;
     }
+    avgResult /= 4;
+    avgDepth /= 4;
+   
 
-    Result[id.xy] = float4(result, 1);
+    Result[id.xy] = float4(avgResult, avgDepth);
 }

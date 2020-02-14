@@ -46,7 +46,8 @@ namespace UnityTemplateProjects
 
             public void UpdateTransform(Transform t)
             {
-                t.eulerAngles = new Vector3(pitch, yaw, roll);
+                t.localRotation = Quaternion.Euler( new Vector3(pitch, yaw, roll));
+
                 t.position = new Vector3(x, y, z);
             }
         }

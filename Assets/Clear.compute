@@ -1,0 +1,37 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+RWTexture2D<float4> _LastFrame;
+RWTexture2D<float4> _LastFrameDepth;
+float4x4 _LastFrameToWorld;
+float4x4 _CameraInverseProjection;
+
+RWTexture2D<float4> _ThisFrame;
+float4x4 _WorldToThisFrameProj;
+
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+
+    float4 lastFrame = _LastFrame.Load(id.xy);
+    float depth = _LastFrameDepth.Load(id.xy).r;
+
+    uint width, height;
+    _LastFrame.GetDimensions(width, height);
+    float2 uv = float2((float2(id.xy) + 0.5) / float2(width, height) * 2.0f - 1.0f);
+
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    float3 origin = mul(_LastFrameToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_LastFrameToWorld, float4(direction, 0.0f)).xyz;
+
+    float3 worldPos = origin + direction * depth;
+
+    float4 clip = mul(_WorldToThisFrameProj, float4(worldPos, 1));
+
+    int2 pixel = (0.5 + 0.5 * (-clip.xy /clip.w)) * int2(width, height);
+
+    _ThisFrame[pixel] = lastFrame;
+}
